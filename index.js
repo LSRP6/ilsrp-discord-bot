@@ -1,193 +1,189 @@
-const { Client, GatewayIntentBits, SlashCommandBuilder } = require('discord.js');
-const { REST } = require('@discordjs/rest');
-const { Routes } = require('discord-api-types/v10');
-const express = require('express');
-const mysql = require('mysql2/promise');
+// ILSRP Discord OAuth2 Bridge
+// Deploy ini ke Railway, lalu isi environment variables:
+//   DISCORD_CLIENT_ID      = Client ID dari Discord Developer Portal
+//   DISCORD_CLIENT_SECRET  = Client Secret dari Discord Developer Portal
+//   REDIRECT_URI           = https://DOMAIN-RAILWAY-KAMU.railway.app/callback
+//   MTA_SECRET             = bebas, string rahasia buat verifikasi request dari MTA
+//   PORT                   = 3000 (Railway set otomatis)
+
+const express = require("express");
+const axios   = require("axios");
+const app     = express();
+
+const {
+  DISCORD_CLIENT_ID,
+  DISCORD_CLIENT_SECRET,
+  REDIRECT_URI,
+  MTA_SECRET,
+  PORT = 3000,
+} = process.env;
+
+// Simpan sesi pending: token sementara → { discordID, username, expires }
+// Pakai Map in-memory, cukup untuk kebutuhan ini
+const pendingSessions = new Map();
+
+// Bersihkan sesi expired setiap 5 menit
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, val] of pendingSessions.entries()) {
+    if (now > val.expires) pendingSessions.delete(key);
+  }
+}, 5 * 60 * 1000);
 
 // ============================================================
-// CONFIG — isi sesuai milik kamu
+// GET /auth?state=TOKEN_SEMENTARA
+// Dipanggil MTA saat player klik "Link Discord"
+// MTA generate state token unik, simpan di server MTA,
+// lalu buka URL ini di browser player
 // ============================================================
-const CONFIG = {
-    DISCORD_TOKEN   : process.env.DISCORD_TOKEN,
-    CLIENT_ID       : process.env.CLIENT_ID,
-    VERIFY_CHANNEL  : process.env.VERIFY_CHANNEL  || 'verify',
-    API_SECRET      : process.env.API_SECRET       || 'ilsrp_secret_key',
-    PORT            : process.env.PORT             || 3000,
-    DB_HOST         : process.env.DB_HOST,
-    DB_USER         : process.env.DB_USER,
-    DB_PASS         : process.env.DB_PASS,
-    DB_NAME         : process.env.DB_NAME,
-    DB_PORT         : process.env.DB_PORT          || 3306,
-};
+app.get("/auth", (req, res) => {
+  const state = req.query.state;
+  if (!state || state.length < 8) {
+    return res.status(400).send(renderPage("Error", "State tidak valid."));
+  }
+
+  const url = new URL("https://discord.com/oauth2/authorize");
+  url.searchParams.set("client_id",     DISCORD_CLIENT_ID);
+  url.searchParams.set("redirect_uri",  REDIRECT_URI);
+  url.searchParams.set("response_type", "code");
+  url.searchParams.set("scope",         "identify");
+  url.searchParams.set("state",         state);
+
+  res.redirect(url.toString());
+});
 
 // ============================================================
-// DATABASE
+// GET /callback?code=XXX&state=TOKEN_SEMENTARA
+// Discord redirect ke sini setelah player approve
 // ============================================================
-let db;
-async function connectDB() {
-    db = await mysql.createConnection({
-        host    : CONFIG.DB_HOST,
-        user    : CONFIG.DB_USER,
-        password: CONFIG.DB_PASS,
-        database: CONFIG.DB_NAME,
-        port    : CONFIG.DB_PORT,
+app.get("/callback", async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.send(renderPage("Dibatalkan", "Kamu membatalkan login Discord.<br>Kembali ke game dan coba lagi."));
+  }
+
+  if (!code || !state) {
+    return res.status(400).send(renderPage("Error", "Parameter tidak lengkap."));
+  }
+
+  try {
+    // Tukar code dengan access token
+    const tokenRes = await axios.post(
+      "https://discord.com/api/oauth2/token",
+      new URLSearchParams({
+        client_id:     DISCORD_CLIENT_ID,
+        client_secret: DISCORD_CLIENT_SECRET,
+        grant_type:    "authorization_code",
+        code,
+        redirect_uri:  REDIRECT_URI,
+      }),
+      { headers: { "Content-Type": "application/x-www-form-urlencoded" } }
+    );
+
+    const accessToken = tokenRes.data.access_token;
+
+    // Ambil info user Discord
+    const userRes = await axios.get("https://discord.com/api/users/@me", {
+      headers: { Authorization: `Bearer ${accessToken}` },
     });
-    console.log('[DB] Connected to MySQL');
+
+    const discordID       = userRes.data.id;
+    const discordUsername = userRes.data.username;
+
+    // Simpan ke pending sessions (MTA akan poll ini)
+    pendingSessions.set(state, {
+      discordID,
+      discordUsername,
+      expires: Date.now() + 10 * 60 * 1000, // 10 menit
+    });
+
+    res.send(renderPage(
+      "Berhasil! ✅",
+      `Akun Discord <b>${discordUsername}</b> berhasil terhubung!<br><br>
+       Kembali ke game — akun kamu akan otomatis terdeteksi.<br>
+       <small>Kamu bisa tutup tab ini.</small>`
+    ));
+
+  } catch (err) {
+    console.error("[OAuth] Error:", err?.response?.data || err.message);
+    res.status(500).send(renderPage("Error", "Gagal menghubungkan akun Discord. Coba lagi."));
+  }
+});
+
+// ============================================================
+// GET /check?state=TOKEN&secret=MTA_SECRET
+// MTA poll endpoint ini untuk cek apakah player sudah auth
+// ============================================================
+app.get("/check", (req, res) => {
+  const { state, secret } = req.query;
+
+  if (secret !== MTA_SECRET) {
+    return res.status(403).json({ ok: false, error: "Unauthorized" });
+  }
+
+  const session = pendingSessions.get(state);
+  if (!session) {
+    return res.json({ ok: false, pending: true });
+  }
+
+  // Hapus setelah diambil (one-time use)
+  pendingSessions.delete(state);
+
+  res.json({
+    ok:              true,
+    discordID:       session.discordID,
+    discordUsername: session.discordUsername,
+  });
+});
+
+// ============================================================
+// Halaman HTML simpel
+// ============================================================
+function renderPage(title, body) {
+  return `<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>${title} — ILSRP</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: #1a1a2e;
+      color: #eee;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+    }
+    .card {
+      background: #16213e;
+      border: 1px solid #0f3460;
+      border-radius: 12px;
+      padding: 40px;
+      max-width: 460px;
+      width: 90%;
+      text-align: center;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+    }
+    .logo { font-size: 2em; margin-bottom: 12px; }
+    h1 { color: #c8962a; margin-bottom: 16px; font-size: 1.4em; }
+    p { line-height: 1.7; color: #ccc; font-size: 0.95em; }
+    small { color: #888; font-size: 0.8em; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">🎮</div>
+    <h1>${title}</h1>
+    <p>${body}</p>
+  </div>
+</body>
+</html>`;
 }
 
-// ============================================================
-// DISCORD BOT
-// ============================================================
-const client = new Client({
-    intents: [
-        GatewayIntentBits.Guilds,
-        GatewayIntentBits.GuildMessages,
-        GatewayIntentBits.MessageContent,
-        GatewayIntentBits.DirectMessages,
-    ]
+app.listen(PORT, () => {
+  console.log(`[ILSRP Auth] Running on port ${PORT}`);
 });
-
-// Register slash command /verify
-async function registerCommands() {
-    const commands = [
-        new SlashCommandBuilder()
-            .setName('verify')
-            .setDescription('Verifikasi akun MTA kamu')
-            .addStringOption(opt =>
-                opt.setName('username')
-                   .setDescription('Username MTA kamu')
-                   .setRequired(true)
-            )
-    ].map(cmd => cmd.toJSON());
-
-    const rest = new REST({ version: '10' }).setToken(CONFIG.DISCORD_TOKEN);
-    try {
-        await rest.put(Routes.applicationCommands(CONFIG.CLIENT_ID), { body: commands });
-        console.log('[Discord] Slash command /verify terdaftar');
-    } catch (err) {
-        console.error('[Discord] Gagal register command:', err);
-    }
-}
-
-client.once('ready', async () => {
-    console.log(`[Discord] Bot online sebagai ${client.user.tag}`);
-    await registerCommands();
-});
-
-// Handle /verify command
-client.on('interactionCreate', async interaction => {
-    if (!interaction.isChatInputCommand()) return;
-    if (interaction.commandName !== 'verify') return;
-
-    // Cek apakah di channel verify
-    if (interaction.channel.name !== CONFIG.VERIFY_CHANNEL) {
-        await interaction.reply({
-            content: `❌ Command ini hanya bisa digunakan di channel **#${CONFIG.VERIFY_CHANNEL}**!`,
-            ephemeral: true
-        });
-        return;
-    }
-
-    const username   = interaction.options.getString('username');
-    const discordID  = interaction.user.id;
-    const discordTag = interaction.user.tag;
-
-    try {
-        // Cek apakah username ada di database
-        const [rows] = await db.execute(
-            'SELECT id, username, discord_id FROM accounts WHERE username = ? LIMIT 1',
-            [username]
-        );
-
-        if (rows.length === 0) {
-            await interaction.reply({
-                content: `❌ Username **${username}** tidak ditemukan di database ILSRP!`,
-                ephemeral: true
-            });
-            return;
-        }
-
-        const account = rows[0];
-
-        // Cek apakah Discord ID sudah dipakai akun lain
-        const [existing] = await db.execute(
-            'SELECT id, username FROM accounts WHERE discord_id = ? AND id != ? LIMIT 1',
-            [discordID, account.id]
-        );
-
-        if (existing.length > 0) {
-            await interaction.reply({
-                content: `❌ Akun Discord kamu sudah terhubung ke username **${existing[0].username}**!`,
-                ephemeral: true
-            });
-            return;
-        }
-
-        // Simpan Discord ID ke database
-        await db.execute(
-            'UPDATE accounts SET discord_id = ? WHERE id = ?',
-            [discordID, account.id]
-        );
-
-        console.log(`[Verify] ${username} → Discord: ${discordTag} (${discordID})`);
-
-        await interaction.reply({
-            content: `✅ Akun **${username}** berhasil terhubung ke Discord kamu!\nSekarang kamu akan menerima notifikasi reset password via Discord DM.`,
-            ephemeral: true
-        });
-
-    } catch (err) {
-        console.error('[Verify] DB error:', err);
-        await interaction.reply({
-            content: '❌ Terjadi error. Coba lagi nanti.',
-            ephemeral: true
-        });
-    }
-});
-
-// ============================================================
-// EXPRESS API — dipanggil dari MTA pakai fetchRemote
-// Endpoint: POST /send-dm
-// Body: { secret, discord_id, message }
-// ============================================================
-const app = express();
-app.use(express.json());
-
-app.post('/send-dm', async (req, res) => {
-    const { secret, discord_id, message } = req.body;
-
-    // Validasi secret key
-    if (secret !== CONFIG.API_SECRET) {
-        return res.status(403).json({ ok: false, error: 'Unauthorized' });
-    }
-
-    if (!discord_id || !message) {
-        return res.status(400).json({ ok: false, error: 'Missing discord_id or message' });
-    }
-
-    try {
-        const user = await client.users.fetch(discord_id);
-        await user.send(message);
-        console.log(`[DM] Pesan terkirim ke ${discord_id}`);
-        res.json({ ok: true });
-    } catch (err) {
-        console.error('[DM] Gagal kirim DM:', err.message);
-        res.status(500).json({ ok: false, error: err.message });
-    }
-});
-
-// Health check
-app.get('/', (req, res) => {
-    res.json({ status: 'ILSRP Discord Bot is running' });
-});
-
-// ============================================================
-// START
-// ============================================================
-(async () => {
-    await connectDB();
-    client.login(CONFIG.DISCORD_TOKEN);
-    app.listen(CONFIG.PORT, () => {
-        console.log(`[API] Express berjalan di port ${CONFIG.PORT}`);
-    });
-})();
