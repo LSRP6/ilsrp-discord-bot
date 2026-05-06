@@ -4,22 +4,25 @@
 //   DISCORD_CLIENT_SECRET  = Client Secret dari Discord Developer Portal
 //   REDIRECT_URI           = https://DOMAIN-RAILWAY-KAMU.railway.app/callback
 //   MTA_SECRET             = bebas, string rahasia buat verifikasi request dari MTA
+//   DISCORD_BOT_TOKEN      = Bot Token dari Discord Developer Portal
 //   PORT                   = 3000 (Railway set otomatis)
 
 const express = require("express");
 const axios   = require("axios");
 const app     = express();
 
+app.use(express.json());
+
 const {
   DISCORD_CLIENT_ID,
   DISCORD_CLIENT_SECRET,
   REDIRECT_URI,
   MTA_SECRET,
+  DISCORD_BOT_TOKEN,
   PORT = 3000,
 } = process.env;
 
 // Simpan sesi pending: token sementara → { discordID, username, expires }
-// Pakai Map in-memory, cukup untuk kebutuhan ini
 const pendingSessions = new Map();
 
 // Bersihkan sesi expired setiap 5 menit
@@ -32,9 +35,6 @@ setInterval(() => {
 
 // ============================================================
 // GET /auth?state=TOKEN_SEMENTARA
-// Dipanggil MTA saat player klik "Link Discord"
-// MTA generate state token unik, simpan di server MTA,
-// lalu buka URL ini di browser player
 // ============================================================
 app.get("/auth", (req, res) => {
   const state = req.query.state;
@@ -54,7 +54,6 @@ app.get("/auth", (req, res) => {
 
 // ============================================================
 // GET /callback?code=XXX&state=TOKEN_SEMENTARA
-// Discord redirect ke sini setelah player approve
 // ============================================================
 app.get("/callback", async (req, res) => {
   const { code, state, error } = req.query;
@@ -68,7 +67,6 @@ app.get("/callback", async (req, res) => {
   }
 
   try {
-    // Tukar code dengan access token
     const tokenRes = await axios.post(
       "https://discord.com/api/oauth2/token",
       new URLSearchParams({
@@ -83,7 +81,6 @@ app.get("/callback", async (req, res) => {
 
     const accessToken = tokenRes.data.access_token;
 
-    // Ambil info user Discord
     const userRes = await axios.get("https://discord.com/api/users/@me", {
       headers: { Authorization: `Bearer ${accessToken}` },
     });
@@ -91,11 +88,10 @@ app.get("/callback", async (req, res) => {
     const discordID       = userRes.data.id;
     const discordUsername = userRes.data.username;
 
-    // Simpan ke pending sessions (MTA akan poll ini)
     pendingSessions.set(state, {
       discordID,
       discordUsername,
-      expires: Date.now() + 10 * 60 * 1000, // 10 menit
+      expires: Date.now() + 10 * 60 * 1000,
     });
 
     res.send(renderPage(
@@ -113,7 +109,6 @@ app.get("/callback", async (req, res) => {
 
 // ============================================================
 // GET /check?state=TOKEN&secret=MTA_SECRET
-// MTA poll endpoint ini untuk cek apakah player sudah auth
 // ============================================================
 app.get("/check", (req, res) => {
   const { state, secret } = req.query;
@@ -127,7 +122,6 @@ app.get("/check", (req, res) => {
     return res.json({ ok: false, pending: true });
   }
 
-  // Hapus setelah diambil (one-time use)
   pendingSessions.delete(state);
 
   res.json({
@@ -135,6 +129,72 @@ app.get("/check", (req, res) => {
     discordID:       session.discordID,
     discordUsername: session.discordUsername,
   });
+});
+
+// ============================================================
+// POST /send-dm
+// Dipanggil MTA untuk kirim DM ke player via Discord Bot
+// Body: { discordID, message, secret }
+// ============================================================
+app.post("/send-dm", async (req, res) => {
+  console.log("[send-dm] Request masuk:", req.body);
+
+  const { discordID, message, secret } = req.body;
+
+  // Validasi secret
+  if (secret !== MTA_SECRET) {
+    console.log("[send-dm] Secret salah!");
+    return res.status(403).json({ ok: false, error: "Unauthorized" });
+  }
+
+  // Validasi parameter
+  if (!discordID || !message) {
+    console.log("[send-dm] Parameter tidak lengkap");
+    return res.status(400).json({ ok: false, error: "discordID dan message wajib diisi" });
+  }
+
+  if (!DISCORD_BOT_TOKEN) {
+    console.log("[send-dm] DISCORD_BOT_TOKEN tidak ada di environment!");
+    return res.status(500).json({ ok: false, error: "Bot token tidak dikonfigurasi" });
+  }
+
+  try {
+    // Buka DM channel dulu
+    console.log("[send-dm] Membuka DM channel ke discordID=" + discordID);
+    const dmChannel = await axios.post(
+      "https://discord.com/api/v10/users/@me/channels",
+      { recipient_id: discordID },
+      {
+        headers: {
+          Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    const channelID = dmChannel.data.id;
+    console.log("[send-dm] DM channel ID=" + channelID);
+
+    // Kirim pesan ke DM channel
+    await axios.post(
+      `https://discord.com/api/v10/channels/${channelID}/messages`,
+      { content: message },
+      {
+        headers: {
+          Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+
+    console.log("[send-dm] SUKSES kirim DM ke discordID=" + discordID);
+    res.json({ ok: true });
+
+  } catch (err) {
+    const errData = err?.response?.data || err.message;
+    console.error("[send-dm] GAGAL:", errData);
+    res.status(500).json({ ok: false, error: errData });
+  }
 });
 
 // ============================================================
